@@ -38,7 +38,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 
 graphify is built around Andrej Karpathy's /raw folder workflow: drop anything into a folder - papers, tweets, screenshots, code, notes - and get a structured knowledge graph that shows you what you didn't know was connected.
 
-Three things it does that Claude alone cannot:
+Three things it does that an AI assistant alone cannot:
 1. **Persistent graph** - relationships are stored in `graphify-out/graph.json` and survive across sessions. Ask questions weeks later without re-reading everything.
 2. **Honest audit trail** - every edge is tagged EXTRACTED, INFERRED, or AMBIGUOUS. You know what was found vs invented.
 3. **Cross-document surprise** - community detection finds connections between concepts in different files that you would never think to ask about directly.
@@ -70,7 +70,6 @@ else
 fi
 "$PYTHON" -c "import graphify" 2>/dev/null || "$PYTHON" -m pip install graphifyy -q 2>/dev/null || "$PYTHON" -m pip install graphifyy -q --break-system-packages 2>&1 | tail -3
 # Write interpreter path for all subsequent steps
-mkdir -p graphify-out
 "$PYTHON" -c "import sys; open('graphify-out/.graphify_python', 'w').write(sys.executable)"
 ```
 
@@ -157,7 +156,7 @@ After transcription:
 
 **Before starting:** note whether `--mode deep` was given. You must pass `DEEP_MODE=true` to every subagent in Step B2 if it was. Track this from the original invocation - do not lose it.
 
-This step has two parts: **structural extraction** (deterministic, free) and **semantic extraction** (Claude, costs tokens).
+This step has two parts: **structural extraction** (deterministic, free) and **semantic extraction** (LLM, costs tokens).
 
 **Run Part A (AST) and Part B (semantic) in parallel. Dispatch all semantic subagents AND start AST extraction in the same message. Both can run simultaneously since they operate on different file types. Merge results in Part C as before.**
 
@@ -193,7 +192,7 @@ else:
 
 **Fast path:** If detection found zero docs, papers, and images (code-only corpus), skip Part B entirely and go straight to Part C. AST handles code - there is nothing for semantic subagents to do.
 
-**MANDATORY: You MUST use the Agent tool here. Reading files yourself one-by-one is forbidden - it is 5-10x slower. If you do not use the Agent tool you are doing this wrong.**
+**MANDATORY: You MUST use the Agent (Task) tool here. Reading files yourself one-by-one is forbidden - it is 5-10x slower. If you do not use the Agent tool you are doing this wrong.**
 
 Before dispatching subagents, print a timing estimate:
 - Load `total_words` and file counts from `.graphify_detect.json`
@@ -229,22 +228,13 @@ Only dispatch subagents for files listed in `.graphify_uncached.txt`. If all fil
 
 Load files from `.graphify_uncached.txt`. Split into chunks of 20-25 files each. Each image gets its own chunk (vision needs separate context). When splitting, group files from the same directory together so related artifacts land in the same chunk and cross-file relationships are more likely to be extracted.
 
-**Step B2 - Dispatch ALL subagents in a single message (Factory Droid)**
+**Step B2 - Dispatch ALL subagents using the Agent tool (Trae)**
 
-> **Factory Droid platform:** Uses the `Task` tool for parallel subagent dispatch.
-> Call `Task` once per chunk — ALL in the same response so they run in parallel.
+> **Trae platform:** Uses the **Agent (Task) tool** to dispatch subagents for parallel extraction.
+> Each subagent runs independently and returns structured JSON results.
+> Trae does NOT support PreToolUse hooks — AGENTS.md rules are the always-on mechanism instead.
 
-Call `Task` once per chunk — ALL in the same response so they run in parallel. Pass the extraction prompt as the task description:
-
-```
-Task(description="Your task is to perform the following. Follow the instructions below exactly.\n\n<agent-instructions>\n[extraction prompt below, with FILE_LIST, CHUNK_NUM, TOTAL_CHUNKS, DEEP_MODE substituted]\n</agent-instructions>\n\nExecute this now. Output ONLY the structured JSON response.")
-```
-
-Collect results as each Task completes. Parse each result as JSON.
-
-Parse each result as JSON. Accumulate nodes/edges/hyperedges across all results and write to `.graphify_semantic_new.json`.
-
-The extraction prompt each subagent receives (substitute FILE_LIST, CHUNK_NUM, TOTAL_CHUNKS, DEEP_MODE):
+Use the **Task/Agent tool** to dispatch one subagent per chunk — launch ALL agents in parallel so they run simultaneously. Each agent receives the extraction prompt below with FILE_LIST, CHUNK_NUM, TOTAL_CHUNKS, DEEP_MODE substituted:
 
 ```
 You are a graphify extraction subagent. Read the files listed and extract a knowledge graph fragment.
@@ -298,6 +288,12 @@ confidence_score is REQUIRED on every edge - never omit it, never use 0.5 as a d
 Output exactly this JSON (no other text):
 {"nodes":[{"id":"filestem_entityname","label":"Human Readable Name","file_type":"code|document|paper|image","source_file":"relative/path","source_location":null,"source_url":null,"captured_at":null,"author":null,"contributor":null}],"edges":[{"source":"node_id","target":"node_id","relation":"calls|implements|references|cites|conceptually_related_to|shares_data_with|semantically_similar_to|rationale_for","confidence":"EXTRACTED|INFERRED|AMBIGUOUS","confidence_score":1.0,"source_file":"relative/path","source_location":null,"weight":1.0}],"hyperedges":[{"id":"snake_case_id","label":"Human Readable Label","nodes":["node_id1","node_id2","node_id3"],"relation":"participate_in|implement|form","confidence":"EXTRACTED|INFERRED","confidence_score":0.75,"source_file":"relative/path"}],"input_tokens":0,"output_tokens":0}
 ```
+
+After all subagents complete, collect their results. For each result:
+- If a subagent returned valid JSON with `nodes` and `edges`, include it
+- If a subagent failed or returned invalid JSON, print a warning and skip that chunk - do not abort
+
+Accumulate nodes/edges/hyperedges across all results and write to `.graphify_semantic_new.json`.
 
 **Step B3 - Collect, cache, and merge**
 
@@ -362,7 +358,6 @@ from pathlib import Path
 ast = json.loads(Path('.graphify_ast.json').read_text())
 sem = json.loads(Path('.graphify_semantic.json').read_text())
 
-# Merge: AST nodes first, semantic nodes deduplicated by id
 seen = {n['id'] for n in ast['nodes']}
 merged_nodes = list(ast['nodes'])
 for n in sem['nodes']:
@@ -409,7 +404,6 @@ tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('
 gods = god_nodes(G)
 surprises = surprising_connections(G, communities)
 labels = {cid: 'Community ' + str(cid) for cid in communities}
-# Placeholder questions - regenerated with real labels in Step 5
 questions = suggest_questions(G, communities, labels)
 
 report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)
@@ -460,10 +454,8 @@ communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}
 
-# LABELS - replace these with the names you chose above
 labels = LABELS_DICT
 
-# Regenerate questions with real community labels (labels affect question phrasing)
 questions = suggest_questions(G, communities, labels)
 
 report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, 'INPUT_PATH', suggested_questions=questions)
@@ -623,19 +615,7 @@ print('graph.graphml written - open in Gephi, yEd, or any GraphML tool')
 python3 -m graphify.serve graphify-out/graph.json
 ```
 
-This starts a stdio MCP server that exposes tools: `query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats`, `shortest_path`. Add to Claude Desktop or any MCP-compatible agent orchestrator so other agents can query the graph live.
-
-To configure in Claude Desktop, add to `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "graphify": {
-      "command": "python3",
-      "args": ["-m", "graphify.serve", "/absolute/path/to/graphify-out/graph.json"]
-    }
-  }
-}
-```
+This starts a stdio MCP server that exposes tools: `query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats`, `shortest_path`.
 
 ### Step 8 - Token reduction benchmark (only if total_words > 5000)
 
@@ -666,11 +646,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from graphify.detect import save_manifest
 
-# Save manifest for --update
 detect = json.loads(Path('.graphify_detect.json').read_text())
 save_manifest(detect['files'])
 
-# Update cumulative cost tracker
 extract = json.loads(Path('.graphify_extract.json').read_text())
 input_tok = extract.get('input_tokens', 0)
 output_tok = extract.get('output_tokens', 0)
@@ -766,7 +744,7 @@ print('code_only:', code_only)
 "
 ```
 
-If `code_only` is True: print `[graphify update] Code-only changes detected - skipping semantic extraction (no LLM needed)`, run only Step 3A (AST) on the changed files, skip Step 3B entirely (no subagents), then go straight to merge and Steps 4–8.
+If `code_only` is True: print `[graphify update] Code-only changes detected - skipping semantic extraction (no LLM needed)`, run only Step 3A (AST) on the changed files, skip Step 3B entirely, then go straight to merge and Steps 4–8.
 
 If `code_only` is False (any changed file is a doc/paper/image): run the full Steps 3A–3C pipeline as normal.
 
@@ -781,15 +759,12 @@ from networkx.readwrite import json_graph
 import networkx as nx
 from pathlib import Path
 
-# Load existing graph
 existing_data = json.loads(Path('graphify-out/graph.json').read_text())
 G_existing = json_graph.node_link_graph(existing_data, edges='links')
 
-# Load new extraction
 new_extraction = json.loads(Path('.graphify_extract.json').read_text())
 G_new = build_from_json(new_extraction)
 
-# Merge: new nodes/edges into existing graph
 G_existing.update(G_new)
 print(f'Merged: {G_existing.number_of_nodes()} nodes, {G_existing.number_of_edges()} edges')
 " 
@@ -808,7 +783,6 @@ from networkx.readwrite import json_graph
 import networkx as nx
 from pathlib import Path
 
-# Load old graph (before update) from backup written before merge
 old_data = json.loads(Path('.graphify_old.json').read_text()) if Path('.graphify_old.json').exists() else None
 new_extract = json.loads(Path('.graphify_extract.json').read_text())
 G_new = build_from_json(new_extract)
@@ -849,7 +823,7 @@ G = json_graph.node_link_graph(data, edges='links')
 
 detection = {'total_files': 0, 'total_words': 99999, 'needs_graph': True, 'warning': None,
              'files': {'code': [], 'document': [], 'paper': []}}
-tokens = {'input': 0, 'output': 0}
+tokens = {'input': 0, 'output':': 0}
 
 communities = cluster(G)
 cohesion = score_all(G, communities)
@@ -915,10 +889,9 @@ data = json.loads(Path('graphify-out/graph.json').read_text())
 G = json_graph.node_link_graph(data, edges='links')
 
 question = 'QUESTION'
-mode = 'MODE'  # 'bfs' or 'dfs'
+mode = 'MODE'
 terms = [t.lower() for t in question.split() if len(t) > 3]
 
-# Find best-matching start nodes
 scored = []
 for nid, ndata in G.nodes(data=True):
     label = ndata.get('label', '').lower()
@@ -936,8 +909,6 @@ subgraph_nodes = set()
 subgraph_edges = []
 
 if mode == 'dfs':
-    # DFS: follow one path as deep as possible before backtracking.
-    # Depth-limited to 6 to avoid traversing the whole graph.
     visited = set()
     stack = [(n, 0) for n in reversed(start_nodes)]
     while stack:
@@ -951,7 +922,6 @@ if mode == 'dfs':
                 stack.append((neighbor, depth + 1))
                 subgraph_edges.append((node, neighbor))
 else:
-    # BFS: explore all neighbors layer by layer up to depth 3.
     frontier = set(start_nodes)
     subgraph_nodes = set(start_nodes)
     for _ in range(3):
@@ -964,11 +934,9 @@ else:
         subgraph_nodes.update(next_frontier)
         frontier = next_frontier
 
-# Token-budget aware output: rank by relevance, cut at budget (~4 chars/token)
-token_budget = BUDGET  # default 2000
+token_budget = BUDGET
 char_budget = token_budget * 4
 
-# Score each node by term overlap for ranked output
 def relevance(nid):
     label = G.nodes[nid].get('label', '').lower()
     return sum(1 for t in terms if t in label)
@@ -982,7 +950,7 @@ for nid in ranked_nodes:
 for u, v in subgraph_edges:
     if u in subgraph_nodes and v in subgraph_nodes:
         d = G.edges[u, v]
-        lines.append(f'  EDGE {G.nodes[u].get(\"label\",u)} --{d.get(\"relation\",\"\")} [{d.get(\"confidence\",\"\")}]--> {G.nodes[v].get(\"label\",v)}')
+        lines.append(f'  EDGE {G.nodes[u].get(\"label\",u)} --{d.get(\"relation\",\"\")}] [{d.get(\"confidence\",\"\")}]--> {G.nodes[v].get(\"label\",v)}')
 
 output = '\n'.join(lines)
 if len(output) > char_budget:
@@ -1104,7 +1072,6 @@ G = json_graph.node_link_graph(data, edges='links')
 term = 'NODE_NAME'
 term_lower = term.lower()
 
-# Find best matching node
 scored = sorted(
     [(sum(1 for w in term_lower.split() if w in G.nodes[n].get('label','').lower()), n)
      for n in G.nodes()],
@@ -1170,7 +1137,7 @@ Supported URL types (auto-detected):
 - Twitter/X → fetched via oEmbed, saved as `.md` with tweet text and author
 - arXiv → abstract + metadata saved as `.md`  
 - PDF → downloaded as `.pdf`
-- Images (.png/.jpg/.webp) → downloaded, Claude vision extracts on next run
+- Images (.png/.jpg/.webp) → downloaded, vision extracts on next run
 - Any webpage → converted to markdown via html2text
 
 ---
@@ -1212,18 +1179,20 @@ If a post-commit hook already exists, graphify appends to it rather than replaci
 
 ---
 
-## For native CLAUDE.md integration
+## For native AGENTS.md integration (Trae)
 
-Run once per project to make graphify always-on in Claude Code sessions:
+Run once per project to make graphify always-on in Trae sessions:
 
 ```bash
-graphify claude install
+graphify trae install       # or: graphify trae-cn install
 ```
 
-This writes a `## graphify` section to the local `CLAUDE.md` that instructs Claude to check the graph before answering codebase questions and rebuild it after code changes. No manual `/graphify` needed in future sessions.
+This writes a `## graphify` section to the local `AGENTS.md` that instructs Trae to check the graph before answering codebase questions and rebuild it after code changes. No manual `/graphify` needed in future sessions.
+
+> **Note:** Unlike Claude Code, Trae does NOT support PreToolUse hooks. The AGENTS.md rules are the always-on mechanism — there is no automatic graph rebuild on tool use. Run `/graphify --update` manually after code changes if the graph needs refreshing.
 
 ```bash
-graphify claude uninstall  # remove the section
+graphify trae uninstall     # or: graphify trae-cn uninstall   # remove the section
 ```
 
 ---
